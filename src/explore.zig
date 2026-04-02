@@ -4,6 +4,8 @@ const idx = @import("index.zig");
 const WordIndex = idx.WordIndex;
 const TrigramIndex = idx.TrigramIndex;
 const SparseNgramIndex = idx.SparseNgramIndex;
+const TrigramIndexTiming = idx.TrigramIndexTiming;
+const SparseNgramTiming = idx.SparseNgramIndex.Timing;
 
 
 pub const SymbolKind = enum(u8) {
@@ -40,6 +42,7 @@ pub const FileOutline = struct {
     imports: std.ArrayList([]const u8) = .{},
     allocator: std.mem.Allocator,
     owns_path: bool = false,
+    owns_symbol_data: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) FileOutline {
         return .{
@@ -52,12 +55,14 @@ pub const FileOutline = struct {
     }
     pub fn deinit(self: *FileOutline) void {
         if (self.owns_path) self.allocator.free(self.path);
-        for (self.symbols.items) |sym| {
-            self.allocator.free(sym.name);
-            if (sym.detail) |d| self.allocator.free(d);
+        if (self.owns_symbol_data) {
+            for (self.symbols.items) |sym| {
+                self.allocator.free(sym.name);
+                if (sym.detail) |d| self.allocator.free(d);
+            }
+            for (self.imports.items) |imp| self.allocator.free(imp);
         }
         self.symbols.deinit(self.allocator);
-        for (self.imports.items) |imp| self.allocator.free(imp);
         self.imports.deinit(self.allocator);
     }
 };
@@ -101,6 +106,19 @@ pub const SearchResult = struct {
     path: []const u8,
     line_num: u32,
     line_text: []const u8,
+};
+
+pub const IndexTiming = struct {
+    parse_ns: i128 = 0,
+    publish_ns: i128 = 0,
+    word_ns: i128 = 0,
+    trigram_ns: i128 = 0,
+    trigram_collect_ns: i128 = 0,
+    trigram_publish_ns: i128 = 0,
+    sparse_ns: i128 = 0,
+    sparse_collect_ns: i128 = 0,
+    sparse_publish_ns: i128 = 0,
+    deps_ns: i128 = 0,
 };
 
 pub const Explorer = struct {
@@ -152,30 +170,60 @@ pub const Explorer = struct {
     }
 
     pub fn indexFile(self: *Explorer, path: []const u8, content: []const u8) !void {
-        return self.indexFileInner(path, content, true, false);
+        return self.indexFileInner(path, content, true, false, null);
     }
 
     /// Fast path: index outline + content storage only, skip word/trigram indexes.
     pub fn indexFileOutlineOnly(self: *Explorer, path: []const u8, content: []const u8) !void {
-        return self.indexFileInner(path, content, false, false);
+        return self.indexFileInner(path, content, false, false, null);
     }
 
     /// Index outline + word index but skip trigram construction (used when trigram is loaded from disk cache).
     pub fn indexFileSkipTrigram(self: *Explorer, path: []const u8, content: []const u8) !void {
-        return self.indexFileInner(path, content, true, true);
+        return self.indexFileInner(path, content, true, true, null);
+    }
+
+    pub fn indexFileTimed(self: *Explorer, path: []const u8, content: []const u8, timing: *IndexTiming) !void {
+        timing.* = .{};
+        return self.indexFileInner(path, content, true, false, timing);
+    }
+
+    pub fn indexFileSkipTrigramTimed(self: *Explorer, path: []const u8, content: []const u8, timing: *IndexTiming) !void {
+        timing.* = .{};
+        return self.indexFileInner(path, content, true, true, timing);
     }
 
 
-fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_index: bool, skip_trigram: bool) !void {
+fn appendBorrowedSymbol(outline: *FileOutline, name: []const u8, kind: SymbolKind, line_num: u32, detail: ?[]const u8) !void {
+    try outline.symbols.append(outline.allocator, .{
+        .name = name,
+        .kind = kind,
+        .line_start = line_num,
+        .line_end = line_num,
+        .detail = detail,
+    });
+}
+
+fn appendBorrowedImport(outline: *FileOutline, import_path: []const u8) !void {
+    try outline.imports.append(outline.allocator, import_path);
+}
+
+
+fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_index: bool, skip_trigram: bool, timing: ?*IndexTiming) !void {
+    const duped_content = try self.allocator.dupe(u8, content);
+    errdefer self.allocator.free(duped_content);
+
+    const parse_start = std.time.nanoTimestamp();
     // Parse outline outside the global explorer write lock.
     // This keeps HTTP/MCP readers from being blocked on line-by-line parsing.
     var outline = FileOutline.init(self.allocator, path);
     errdefer outline.deinit();
-    outline.byte_size = content.len;
+    outline.byte_size = duped_content.len;
+    outline.owns_symbol_data = false;
 
     var line_num: u32 = 0;
     var prev_line_trimmed: []const u8 = "";
-    var lines = std.mem.splitScalar(u8, content, '\n');
+    var lines = std.mem.splitScalar(u8, duped_content, '\n');
     while (lines.next()) |line| {
         line_num += 1;
         const trimmed = std.mem.trim(u8, line, " \t");
@@ -193,9 +241,14 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
         prev_line_trimmed = trimmed;
     }
     outline.line_count = line_num;
+    if (timing) |t| {
+        t.parse_ns += std.time.nanoTimestamp() - parse_start;
+    }
 
     self.mu.lock();
     defer self.mu.unlock();
+
+    const publish_start = std.time.nanoTimestamp();
 
     // Reuse existing key if file was already indexed, else dupe.
     const outline_gop = try self.outlines.getOrPut(path);
@@ -220,8 +273,6 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
     // Ensure outline path uses the stable map key.
     outline.path = stable_path;
 
-    const duped_content = try self.allocator.dupe(u8, content);
-    errdefer self.allocator.free(duped_content);
     const content_gop = try self.contents.getOrPut(stable_path);
     var prior_content: ?[]const u8 = null;
     if (content_gop.found_existing) {
@@ -237,25 +288,58 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
             _ = self.contents.remove(stable_path);
         }
     }
+    if (timing) |t| {
+        t.publish_ns += std.time.nanoTimestamp() - publish_start;
+    }
 
     // Build search indexes.
     if (full_index) {
-        try self.word_index.indexFile(stable_path, content);
+        const word_start = std.time.nanoTimestamp();
+        try self.word_index.indexFile(stable_path, duped_content);
+        if (timing) |t| {
+            t.word_ns += std.time.nanoTimestamp() - word_start;
+        }
         if (!skip_trigram) {
-            try self.trigram_index.indexFile(stable_path, content);
-            try self.sparse_ngram_index.indexFile(stable_path, content);
+            const trigram_start = std.time.nanoTimestamp();
+            if (timing) |t| {
+                var trigram_timing: TrigramIndexTiming = .{};
+                try self.trigram_index.indexFileTimed(stable_path, duped_content, &trigram_timing);
+                t.trigram_collect_ns += trigram_timing.collect_ns;
+                t.trigram_publish_ns += trigram_timing.publish_ns;
+            } else {
+                try self.trigram_index.indexFile(stable_path, duped_content);
+            }
+            if (timing) |t| {
+                t.trigram_ns += std.time.nanoTimestamp() - trigram_start;
+            }
+
+            const sparse_start = std.time.nanoTimestamp();
+            if (timing) |t| {
+                var sparse_timing: SparseNgramTiming = .{};
+                try self.sparse_ngram_index.indexFileTimed(stable_path, duped_content, &sparse_timing);
+                t.sparse_collect_ns += sparse_timing.collect_ns;
+                t.sparse_publish_ns += sparse_timing.publish_ns;
+            } else {
+                try self.sparse_ngram_index.indexFile(stable_path, duped_content);
+            }
+            if (timing) |t| {
+                t.sparse_ns += std.time.nanoTimestamp() - sparse_start;
+            }
         }
     }
 
-
+    const deps_start = std.time.nanoTimestamp();
     try self.rebuildDepsFor(stable_path, &outline);
+    if (timing) |t| {
+        t.deps_ns += std.time.nanoTimestamp() - deps_start;
+    }
 
     outline_gop.value_ptr.* = outline;
-    if (prior_content) |old_content| {
-        self.allocator.free(old_content);
-    }
     if (prior_outline) |*old_outline| {
         old_outline.deinit();
+    }
+    if (prior_content) |old_content| {
+        self.allocator.free(old_content);
     }
 }
     /// Rebuild trigram index from the stored file contents.
@@ -274,9 +358,15 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
     pub fn removeFile(self: *Explorer, path: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();
+        var owned_key: ?[]const u8 = null;
         if (self.dep_graph.getPtr(path)) |deps| {
             deps.deinit(self.allocator);
             _ = self.dep_graph.remove(path);
+        }
+        if (self.outlines.fetchRemove(path)) |kv| {
+            var outline = kv.value;
+            outline.deinit();
+            owned_key = kv.key;
         }
         if (self.contents.getPtr(path)) |content| {
             self.allocator.free(content.*);
@@ -285,11 +375,8 @@ fn indexFileInner(self: *Explorer, path: []const u8, content: []const u8, full_i
         self.word_index.removeFile(path);
         self.trigram_index.removeFile(path);
         self.sparse_ngram_index.removeFile(path);
-
-        if (self.outlines.fetchRemove(path)) |kv| {
-            var outline = kv.value;
-            outline.deinit();
-            self.allocator.free(kv.key);
+        if (owned_key) |key| {
+            self.allocator.free(key);
         }
     }
 
@@ -643,21 +730,11 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
     // ── Language parsers ──────────────────────────────────────
 
     fn parseZigLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
-        const a = self.allocator;
+        _ = self;
         if (startsWith(line, "pub fn ") or startsWith(line, "fn ")) {
             const start: usize = if (startsWith(line, "pub fn ")) 7 else 3;
             if (extractIdent(line[start..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .function,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendBorrowedSymbol(outline, name, .function, line_num, line);
             }
         } else if (startsWith(line, "pub const ") or startsWith(line, "const ")) {
             const start: usize = if (startsWith(line, "pub const ")) 10 else 6;
@@ -674,120 +751,53 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
                 else
                     .constant;
 
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = kind,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendBorrowedSymbol(outline, name, kind, line_num, line);
 
                 if (kind == .import) {
                     if (extractStringLiteral(line)) |import_path| {
-                        const import_copy = try a.dupe(u8, import_path);
-                        errdefer a.free(import_copy);
-                        try outline.imports.append(a, import_copy);
+                        try appendBorrowedImport(outline, import_path);
                     }
                 }
             }
         } else if (startsWith(line, "test ")) {
-            const name_copy = try a.dupe(u8, line);
-            errdefer a.free(name_copy);
-            try outline.symbols.append(a, .{
-                .name = name_copy,
-                .kind = .test_decl,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendBorrowedSymbol(outline, line, .test_decl, line_num, null);
         }
     }
 
     fn parsePythonLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
-        const a = self.allocator;
+        _ = self;
         if (startsWith(line, "def ")) {
             if (extractIdent(line[4..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .function,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendBorrowedSymbol(outline, name, .function, line_num, line);
             }
         } else if (startsWith(line, "class ")) {
             if (extractIdent(line[6..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .struct_def,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendBorrowedSymbol(outline, name, .struct_def, line_num, line);
             }
         } else if (startsWith(line, "import ") or startsWith(line, "from ")) {
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
-            const import_copy = try a.dupe(u8, line);
-            errdefer a.free(import_copy);
-            try outline.imports.append(a, import_copy);
+            try appendBorrowedSymbol(outline, line, .import, line_num, null);
+            try appendBorrowedImport(outline, line);
         }
     }
     fn parseTsLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline) !void {
-        const a = self.allocator;
+        _ = self;
         if (containsAny(line, &.{ "function ", "const ", "export function ", "export const " })) {
             const kind: SymbolKind = if (std.mem.indexOf(u8, line, "function") != null) .function else .constant;
             const trimmed = skipKeywords(line);
             if (extractIdent(trimmed)) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = kind,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendBorrowedSymbol(outline, name, kind, line_num, line);
             }
         }
         if (containsAny(line, &.{ "import ", "require(" })) {
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
+            try appendBorrowedSymbol(outline, line, .import, line_num, null);
             if (extractStringLiteral(line)) |path| {
-                const import_copy = try a.dupe(u8, path);
-                errdefer a.free(import_copy);
-                try outline.imports.append(a, import_copy);
+                try appendBorrowedImport(outline, path);
             }
         }
     }
 
     fn parseRustLine(self: *Explorer, line: []const u8, line_num: u32, outline: *FileOutline, prev_line: []const u8) !void {
-        const a = self.allocator;
+        _ = self;
 
         // fn / pub fn / pub(crate) fn / async fn / pub async fn / unsafe fn
         if (containsAny(line, &.{"fn "})) {
@@ -808,17 +818,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
                         const is_test = std.mem.eql(u8, prev_line, "#[test]") or
                             startsWith(prev_line, "#[tokio::test");
                         const kind: SymbolKind = if (is_test) .test_decl else .function;
-                        const name_copy = try a.dupe(u8, name);
-                        errdefer a.free(name_copy);
-                        const detail_copy = try a.dupe(u8, line);
-                        errdefer a.free(detail_copy);
-                        try outline.symbols.append(a, .{
-                            .name = name_copy,
-                            .kind = kind,
-                            .line_start = line_num,
-                            .line_end = line_num,
-                            .detail = detail_copy,
-                        });
+                        try appendBorrowedSymbol(outline, name, kind, line_num, line);
                     }
                 }
             }
@@ -828,17 +828,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
         if (startsWith(line, "struct ") or startsWith(line, "pub struct ") or startsWith(line, "pub(crate) struct ")) {
             if (std.mem.indexOf(u8, line, "struct ")) |pos| {
                 if (extractIdent(line[pos + 7 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .struct_def,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendBorrowedSymbol(outline, name, .struct_def, line_num, line);
                 }
             }
         }
@@ -847,17 +837,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
         if (startsWith(line, "enum ") or startsWith(line, "pub enum ") or startsWith(line, "pub(crate) enum ")) {
             if (std.mem.indexOf(u8, line, "enum ")) |pos| {
                 if (extractIdent(line[pos + 5 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .enum_def,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendBorrowedSymbol(outline, name, .enum_def, line_num, line);
                 }
             }
         }
@@ -866,17 +846,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
         if (startsWith(line, "trait ") or startsWith(line, "pub trait ") or startsWith(line, "pub(crate) trait ") or startsWith(line, "unsafe trait ") or startsWith(line, "pub unsafe trait ")) {
             if (std.mem.indexOf(u8, line, "trait ")) |pos| {
                 if (extractIdent(line[pos + 6 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .trait_def,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendBorrowedSymbol(outline, name, .trait_def, line_num, line);
                 }
             }
         }
@@ -889,17 +859,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
                 } else break :blk 5;
             } else 5;
             if (extractIdent(line[impl_start..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .impl_block,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendBorrowedSymbol(outline, name, .impl_block, line_num, line);
             }
         }
 
@@ -907,17 +867,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
         if (startsWith(line, "type ") or startsWith(line, "pub type ") or startsWith(line, "pub(crate) type ")) {
             if (std.mem.indexOf(u8, line, "type ")) |pos| {
                 if (extractIdent(line[pos + 5 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .type_alias,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendBorrowedSymbol(outline, name, .type_alias, line_num, line);
                 }
             }
         }
@@ -929,17 +879,7 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
             const keyword = if (std.mem.indexOf(u8, line, "static ")) |_| "static " else "const ";
             if (std.mem.indexOf(u8, line, keyword)) |pos| {
                 if (extractIdent(line[pos + keyword.len ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    const detail_copy = try a.dupe(u8, line);
-                    errdefer a.free(detail_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .constant,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                        .detail = detail_copy,
-                    });
+                    try appendBorrowedSymbol(outline, name, .constant, line_num, line);
                 }
             }
         }
@@ -947,47 +887,19 @@ pub fn getHotFiles(self: *Explorer, store: *Store, allocator: std.mem.Allocator,
         // macro_rules!
         if (startsWith(line, "macro_rules!")) {
             if (extractIdent(line[13..])) |name| {
-                const name_copy = try a.dupe(u8, name);
-                errdefer a.free(name_copy);
-                const detail_copy = try a.dupe(u8, line);
-                errdefer a.free(detail_copy);
-                try outline.symbols.append(a, .{
-                    .name = name_copy,
-                    .kind = .macro_def,
-                    .line_start = line_num,
-                    .line_end = line_num,
-                    .detail = detail_copy,
-                });
+                try appendBorrowedSymbol(outline, name, .macro_def, line_num, line);
             }
         }
 
         // use / mod
         if (startsWith(line, "use ") or startsWith(line, "pub use ") or startsWith(line, "pub(crate) use ")) {
-            const symbol_copy = try a.dupe(u8, line);
-            errdefer a.free(symbol_copy);
-            try outline.symbols.append(a, .{
-                .name = symbol_copy,
-                .kind = .import,
-                .line_start = line_num,
-                .line_end = line_num,
-            });
-            const import_copy = try a.dupe(u8, line);
-            errdefer a.free(import_copy);
-            try outline.imports.append(a, import_copy);
+            try appendBorrowedSymbol(outline, line, .import, line_num, null);
+            try appendBorrowedImport(outline, line);
         } else if (startsWith(line, "mod ") or startsWith(line, "pub mod ") or startsWith(line, "pub(crate) mod ")) {
             if (std.mem.indexOf(u8, line, "mod ")) |pos| {
                 if (extractIdent(line[pos + 4 ..])) |name| {
-                    const name_copy = try a.dupe(u8, name);
-                    errdefer a.free(name_copy);
-                    try outline.symbols.append(a, .{
-                        .name = name_copy,
-                        .kind = .import,
-                        .line_start = line_num,
-                        .line_end = line_num,
-                    });
-                    const import_copy = try a.dupe(u8, name);
-                    errdefer a.free(import_copy);
-                    try outline.imports.append(a, import_copy);
+                    try appendBorrowedSymbol(outline, name, .import, line_num, null);
+                    try appendBorrowedImport(outline, name);
                 }
             }
         }

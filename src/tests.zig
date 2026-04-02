@@ -282,6 +282,24 @@ test "word index: deduped search" {
     try testing.expect(hits.len == 1);
 }
 
+test "word index: re-index preserves line hits without stale entries" {
+    var wi = WordIndex.init(testing.allocator);
+    defer wi.deinit();
+
+    try wi.indexFile("f.zig", "hello hello\nstale_word\n");
+    try testing.expectEqual(@as(usize, 1), wi.search("hello").len);
+    try testing.expectEqual(@as(u32, 1), wi.search("hello")[0].line_num);
+    try testing.expectEqual(@as(usize, 1), wi.search("stale_word").len);
+
+    try wi.indexFile("f.zig", "world\nhello\nhello\n");
+
+    const hello_hits = wi.search("hello");
+    try testing.expectEqual(@as(usize, 2), hello_hits.len);
+    try testing.expectEqual(@as(u32, 2), hello_hits[0].line_num);
+    try testing.expectEqual(@as(u32, 3), hello_hits[1].line_num);
+    try testing.expectEqual(@as(usize, 0), wi.search("stale_word").len);
+}
+
 // ── Trigram index tests ─────────────────────────────────────
 
 test "trigram index: index and candidate lookup" {
@@ -949,6 +967,30 @@ test "explorer: reindex OOM keeps prior outline reachable" {
         testing.allocator.free(new_results);
     }
     try testing.expect(new_results.len == 1);
+}
+
+test "explorer: reindex refreshes content-backed outline data" {
+    var explorer = Explorer.init(testing.allocator);
+    defer explorer.deinit();
+
+    try explorer.indexFile(
+        "refresh.zig",
+        "const OldDep = @import(\"old.zig\");\npub fn oldName() void {}\n",
+    );
+    try explorer.indexFile(
+        "refresh.zig",
+        "const NewDep = @import(\"new.zig\");\npub fn newName() void {}\n",
+    );
+
+    var outline = (try explorer.getOutline("refresh.zig", testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer outline.deinit();
+
+    try testing.expectEqual(@as(usize, 2), outline.symbols.items.len);
+    try testing.expectEqual(@as(usize, 1), outline.imports.items.len);
+    try testing.expectEqualStrings("NewDep", outline.symbols.items[0].name);
+    try testing.expectEqualStrings("const NewDep = @import(\"new.zig\");", outline.symbols.items[0].detail.?);
+    try testing.expectEqualStrings("newName", outline.symbols.items[1].name);
+    try testing.expectEqualStrings("new.zig", outline.imports.items[0]);
 }
 
 test "explorer: getOutline clone OOM preserves source outline" {

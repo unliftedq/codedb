@@ -1,6 +1,7 @@
 const std = @import("std");
 const Store = @import("store.zig").Store;
 const Explorer = @import("explore.zig").Explorer;
+const IndexTiming = @import("explore.zig").IndexTiming;
 
 pub const EventKind = enum(u8) {
     created,
@@ -237,15 +238,148 @@ pub fn initialScan(store: *Store, explorer: *Explorer, root: []const u8, allocat
     var dir = try std.fs.cwd().openDir(root, .{ .iterate = true });
     defer dir.close();
 
+    const ns_per_ms = std.time.ns_per_ms;
+    const scan_start = std.time.nanoTimestamp();
+
     var walker = try FilteredWalker.init(dir, allocator);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    var walk_ns: i128 = 0;
+    var stat_ns: i128 = 0;
+    var snapshot_ns: i128 = 0;
+    var open_ns: i128 = 0;
+    var read_ns: i128 = 0;
+    var index_ns: i128 = 0;
+    var parse_ns: i128 = 0;
+    var publish_ns: i128 = 0;
+    var word_ns: i128 = 0;
+    var trigram_ns: i128 = 0;
+    var trigram_collect_ns: i128 = 0;
+    var trigram_publish_ns: i128 = 0;
+    var sparse_ns: i128 = 0;
+    var sparse_collect_ns: i128 = 0;
+    var sparse_publish_ns: i128 = 0;
+    var deps_ns: i128 = 0;
+    var file_count: u64 = 0;
+    var indexed_count: u64 = 0;
+    var skipped_ext: u64 = 0;
+    var skipped_size: u64 = 0;
+    var skipped_binary: u64 = 0;
+
+    while (true) {
+        const walk_start = std.time.nanoTimestamp();
+        const maybe_entry = try walker.next();
+        walk_ns += std.time.nanoTimestamp() - walk_start;
+
+        const entry = maybe_entry orelse break;
+        file_count += 1;
+
+        const stat_start = std.time.nanoTimestamp();
         const stat = dir.statFile(entry.path) catch continue;
+        stat_ns += std.time.nanoTimestamp() - stat_start;
+
+        const snapshot_start = std.time.nanoTimestamp();
         _ = try store.recordSnapshot(entry.path, stat.size, 0);
-        // Index outline + content + word/trigram for full search support
-        indexFileContent(explorer, dir, entry.path, allocator, skip_trigram) catch {};
+        snapshot_ns += std.time.nanoTimestamp() - snapshot_start;
+
+        switch (indexFileContentTimed(explorer, dir, entry.path, allocator, skip_trigram, &open_ns, &read_ns, &index_ns, &parse_ns, &publish_ns, &word_ns, &trigram_ns, &trigram_collect_ns, &trigram_publish_ns, &sparse_ns, &sparse_collect_ns, &sparse_publish_ns, &deps_ns)) {
+            .indexed => indexed_count += 1,
+            .skipped_ext => skipped_ext += 1,
+            .skipped_size => skipped_size += 1,
+            .skipped_binary => skipped_binary += 1,
+            .err => {},
+        }
     }
+
+    const total_ns = std.time.nanoTimestamp() - scan_start;
+    std.log.info("initialScan total={d}ms walk={d}ms stat={d}ms snapshot={d}ms open={d}ms read={d}ms index={d}ms parse={d}ms publish={d}ms word={d}ms trigram={d}ms trigram_collect={d}ms trigram_publish={d}ms sparse={d}ms sparse_collect={d}ms sparse_publish={d}ms deps={d}ms files={d} indexed={d} skip_ext={d} skip_size={d} skip_binary={d}", .{
+        @as(i64, @intCast(@divTrunc(total_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(walk_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(stat_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(snapshot_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(open_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(read_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(index_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(parse_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(publish_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(word_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(trigram_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(trigram_collect_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(trigram_publish_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(sparse_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(sparse_collect_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(sparse_publish_ns, ns_per_ms))),
+        @as(i64, @intCast(@divTrunc(deps_ns, ns_per_ms))),
+        file_count,
+        indexed_count,
+        skipped_ext,
+        skipped_size,
+        skipped_binary,
+    });
+}
+
+const IndexResult = enum { indexed, skipped_ext, skipped_size, skipped_binary, err };
+
+fn indexFileContentTimed(
+    explorer: *Explorer,
+    dir: std.fs.Dir,
+    path: []const u8,
+    allocator: std.mem.Allocator,
+    skip_trigram: bool,
+    open_ns: *i128,
+    read_ns: *i128,
+    index_ns: *i128,
+    parse_ns: *i128,
+    publish_ns: *i128,
+    word_ns: *i128,
+    trigram_ns: *i128,
+    trigram_collect_ns: *i128,
+    trigram_publish_ns: *i128,
+    sparse_ns: *i128,
+    sparse_collect_ns: *i128,
+    sparse_publish_ns: *i128,
+    deps_ns: *i128,
+) IndexResult {
+    if (shouldSkipFile(path)) return .skipped_ext;
+
+    const open_start = std.time.nanoTimestamp();
+    const file = dir.openFile(path, .{}) catch return .err;
+    open_ns.* += std.time.nanoTimestamp() - open_start;
+    defer file.close();
+
+    const stat = file.stat() catch return .err;
+    if (stat.size > 512 * 1024) return .skipped_size;
+
+    const read_start = std.time.nanoTimestamp();
+    const content = file.readToEndAlloc(allocator, 512 * 1024) catch return .err;
+    read_ns.* += std.time.nanoTimestamp() - read_start;
+    defer allocator.free(content);
+
+    const check_len = @min(content.len, 512);
+    for (content[0..check_len]) |c| {
+        if (c == 0) return .skipped_binary;
+    }
+
+    const index_start = std.time.nanoTimestamp();
+    var timing: IndexTiming = .{};
+    if (skip_trigram) {
+        explorer.indexFileSkipTrigramTimed(path, content, &timing) catch return .err;
+    } else {
+        explorer.indexFileTimed(path, content, &timing) catch return .err;
+    }
+    index_ns.* += std.time.nanoTimestamp() - index_start;
+    parse_ns.* += timing.parse_ns;
+    publish_ns.* += timing.publish_ns;
+    word_ns.* += timing.word_ns;
+    trigram_ns.* += timing.trigram_ns;
+    trigram_collect_ns.* += timing.trigram_collect_ns;
+    trigram_publish_ns.* += timing.trigram_publish_ns;
+    sparse_ns.* += timing.sparse_ns;
+    sparse_collect_ns.* += timing.sparse_collect_ns;
+    sparse_publish_ns.* += timing.sparse_publish_ns;
+    deps_ns.* += timing.deps_ns;
+
+    return .indexed;
 }
 
 /// Fast index: parse symbols/outline only, skip expensive word+trigram indexes.

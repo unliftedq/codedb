@@ -9,6 +9,11 @@ pub const WordHit = struct {
 };
 
 pub const WordIndex = struct {
+    const LocalWordHits = struct {
+        lines: std.ArrayListUnmanaged(u32) = .{},
+        last_line_num: u32 = 0,
+    };
+
     /// word → hits
     index: std.StringHashMap(std.ArrayList(WordHit)),
     /// path → set of words contributed (for efficient re-index cleanup)
@@ -77,8 +82,13 @@ pub const WordIndex = struct {
         // Clean up old entries first
         self.removeFile(path);
 
-        var words_set = std.StringHashMap(void).init(self.allocator);
-        errdefer words_set.deinit();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
+
+        var local_hits = std.StringHashMap(LocalWordHits).init(temp_alloc);
+        defer local_hits.deinit();
+
         var line_num: u32 = 0;
         var lines = std.mem.splitScalar(u8, content, '\n');
 
@@ -86,38 +96,44 @@ pub const WordIndex = struct {
             line_num += 1;
             var tok = WordTokenizer{ .buf = line };
             while (tok.next()) |word| {
-                if (word.len < 2) continue; // skip single chars
+                if (word.len < 2) continue;
 
-                // Ensure word is in the global index
-                const gop = try self.index.getOrPut(word);
-                if (!gop.found_existing) {
-                    const duped_word = try self.allocator.dupe(u8, word);
-                    gop.key_ptr.* = duped_word;
-                    gop.value_ptr.* = .{};
+                const local_gop = try local_hits.getOrPut(word);
+                if (!local_gop.found_existing) {
+                    local_gop.value_ptr.* = .{};
                 }
+                if (local_gop.value_ptr.last_line_num == line_num) continue;
 
-                if (gop.value_ptr.items.len > 0) {
-                    const last = gop.value_ptr.items[gop.value_ptr.items.len - 1];
-                    if (std.mem.eql(u8, last.path, path) and last.line_num == line_num) {
-                        // Avoid duplicate hits for repeated words on the same line.
-                        const wgop = try words_set.getOrPut(word);
-                        if (!wgop.found_existing) wgop.key_ptr.* = gop.key_ptr.*;
-                        continue;
-                    }
-                }
-
-                try gop.value_ptr.append(self.allocator, .{
-                    .path = path,
-                    .line_num = line_num,
-                });
-
-                // Track that this file contributed this word
-                const wgop = try words_set.getOrPut(word);
-                if (!wgop.found_existing) {
-                    // Point to the same key in the index (no extra alloc)
-                    wgop.key_ptr.* = gop.key_ptr.*;
-                }
+                local_gop.value_ptr.last_line_num = line_num;
+                try local_gop.value_ptr.lines.append(temp_alloc, line_num);
             }
+        }
+
+        var words_set = std.StringHashMap(void).init(self.allocator);
+        errdefer words_set.deinit();
+        try words_set.ensureTotalCapacity(@intCast(local_hits.count()));
+
+        var local_iter = local_hits.iterator();
+        while (local_iter.next()) |entry| {
+            const word = entry.key_ptr.*;
+            const line_hits = entry.value_ptr.lines.items;
+
+            const gop = try self.index.getOrPut(word);
+            if (!gop.found_existing) {
+                const duped_word = try self.allocator.dupe(u8, word);
+                gop.key_ptr.* = duped_word;
+                gop.value_ptr.* = .{};
+            }
+
+            try gop.value_ptr.ensureTotalCapacity(self.allocator, gop.value_ptr.items.len + line_hits.len);
+            for (line_hits) |hit_line| {
+                gop.value_ptr.appendAssumeCapacity(.{
+                    .path = path,
+                    .line_num = hit_line,
+                });
+            }
+
+            words_set.putAssumeCapacity(gop.key_ptr.*, {});
         }
 
         try self.file_words.put(path, words_set);
@@ -179,6 +195,11 @@ pub const PostingMask = struct {
     loc_mask: u8 = 0, // bit mask of (position % 8) where trigram appears
 };
 
+pub const TrigramIndexTiming = struct {
+    collect_ns: i128 = 0,
+    publish_ns: i128 = 0,
+};
+
 
 pub const TrigramIndex = struct {
     /// trigram → set of file paths
@@ -228,12 +249,26 @@ pub const TrigramIndex = struct {
     }
 
     pub fn indexFile(self: *TrigramIndex, path: []const u8, content: []const u8) !void {
+        return self.indexFileInner(path, content, null);
+    }
+
+    pub fn indexFileTimed(self: *TrigramIndex, path: []const u8, content: []const u8, timing: *TrigramIndexTiming) !void {
+        timing.* = .{};
+        return self.indexFileInner(path, content, timing);
+    }
+
+    fn indexFileInner(self: *TrigramIndex, path: []const u8, content: []const u8, timing: ?*TrigramIndexTiming) !void {
         self.removeFile(path);
 
-        var seen_trigrams = std.AutoHashMap(Trigram, void).init(self.allocator);
-        defer seen_trigrams.deinit();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
 
-        // Extract trigrams from content, recording PostingMask per (trigram, file)
+        var local = std.AutoHashMap(Trigram, PostingMask).init(temp_alloc);
+        defer local.deinit();
+
+        const collect_start = std.time.nanoTimestamp();
+
         if (content.len >= 3) {
             for (0..content.len - 2) |i| {
                 const tri = packTrigram(
@@ -241,34 +276,42 @@ pub const TrigramIndex = struct {
                     normalizeChar(content[i + 1]),
                     normalizeChar(content[i + 2]),
                 );
-                // Ensure the trigram → file_set entry exists
-                const idx_gop = try self.index.getOrPut(tri);
-                if (!idx_gop.found_existing) {
-                    idx_gop.value_ptr.* = std.StringHashMap(PostingMask).init(self.allocator);
+                const gop = try local.getOrPut(tri);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = PostingMask{};
                 }
-                // Get or create the posting for this file
-                const file_gop = try idx_gop.value_ptr.getOrPut(path);
-                if (!file_gop.found_existing) {
-                    file_gop.value_ptr.* = PostingMask{};
-                    // Track this trigram for cleanup (only once per file)
-                    try seen_trigrams.put(tri, {});
-                }
-                // OR in position masks
-                file_gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
+                gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
                 if (i + 3 < content.len) {
-                    file_gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
+                    gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
                 }
             }
         }
+        if (timing) |t| {
+            t.collect_ns += std.time.nanoTimestamp() - collect_start;
+        }
 
-        // Store which trigrams this file contributed
         var tri_list: std.ArrayList(Trigram) = .{};
         errdefer tri_list.deinit(self.allocator);
-        var tri_iter = seen_trigrams.keyIterator();
-        while (tri_iter.next()) |tri_ptr| {
-            try tri_list.append(self.allocator, tri_ptr.*);
+        try tri_list.ensureTotalCapacity(self.allocator, local.count());
+
+        const publish_start = std.time.nanoTimestamp();
+
+        var local_iter = local.iterator();
+        while (local_iter.next()) |entry| {
+            const tri = entry.key_ptr.*;
+            const mask = entry.value_ptr.*;
+
+            const idx_gop = try self.index.getOrPut(tri);
+            if (!idx_gop.found_existing) {
+                idx_gop.value_ptr.* = std.StringHashMap(PostingMask).init(self.allocator);
+            }
+            try idx_gop.value_ptr.put(path, mask);
+            tri_list.appendAssumeCapacity(tri);
         }
         try self.file_trigrams.put(path, tri_list);
+        if (timing) |t| {
+            t.publish_ns += std.time.nanoTimestamp() - publish_start;
+        }
     }
 
 
@@ -498,7 +541,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
     /// Write the current in-memory index to disk in a two-file format.
     /// Files are written atomically (write to tmp, then rename).
     pub fn writeToDisk(self: *TrigramIndex, dir_path: []const u8, git_head: ?[40]u8) !void {
-        // Step 1: Build file table (assign u16 IDs to all unique paths)
+        // Step 1: Build file table (assign u32 IDs to all unique paths)
         var file_table: std.ArrayList([]const u8) = .{};
         defer file_table.deinit(self.allocator);
         var path_to_id = std.StringHashMap(u32).init(self.allocator);
@@ -1392,6 +1435,57 @@ pub fn buildCoveringSet(query: []const u8, allocator: std.mem.Allocator) ![]Spar
     return result.toOwnedSlice(allocator);
 }
 
+fn appendSparseSpanHash(content: []const u8, start: usize, end_pair: usize, seen: *std.AutoHashMap(u64, void)) !void {
+    const MIN_LEN = 3;
+    const ngram_end = end_pair + 2;
+    const ngram_len = ngram_end - start;
+
+    if (ngram_len < MIN_LEN) return;
+
+    if (ngram_len <= MAX_NGRAM_LEN) {
+        _ = try seen.getOrPut(makeNgram(content, start, ngram_len).hash);
+        return;
+    }
+
+    var off = start;
+    while (off + MAX_NGRAM_LEN <= ngram_end) {
+        _ = try seen.getOrPut(makeNgram(content, off, MAX_NGRAM_LEN).hash);
+        off += MAX_NGRAM_LEN;
+    }
+
+    const rem = ngram_end - off;
+    if (rem >= MIN_LEN) {
+        _ = try seen.getOrPut(makeNgram(content, off, rem).hash);
+    } else if (rem > 0) {
+        _ = try seen.getOrPut(makeNgram(content, ngram_end - MIN_LEN, MIN_LEN).hash);
+    }
+}
+
+fn collectUniqueSparseNgramHashes(content: []const u8, seen: *std.AutoHashMap(u64, void)) !void {
+    const MIN_LEN = 3;
+    if (content.len < MIN_LEN) return;
+
+    const pair_count = content.len - 1;
+    var prev_boundary: usize = 0;
+
+    if (pair_count >= 3) {
+        var prev_weight = pairWeight(normalizeChar(content[0]), normalizeChar(content[1]));
+        var curr_weight = pairWeight(normalizeChar(content[1]), normalizeChar(content[2]));
+        var i: usize = 1;
+        while (i + 1 < pair_count) : (i += 1) {
+            const next_weight = pairWeight(normalizeChar(content[i + 1]), normalizeChar(content[i + 2]));
+            if (curr_weight > prev_weight and curr_weight > next_weight) {
+                try appendSparseSpanHash(content, prev_boundary, i, seen);
+                prev_boundary = i;
+            }
+            prev_weight = curr_weight;
+            curr_weight = next_weight;
+        }
+    }
+
+    try appendSparseSpanHash(content, prev_boundary, pair_count - 1, seen);
+}
+
 /// In-memory sparse n-gram index.  Mirrors the TrigramIndex API so it can
 /// be used as a drop-in acceleration layer alongside the trigram index.
 pub const SparseNgramIndex = struct {
@@ -1439,31 +1533,54 @@ pub const SparseNgramIndex = struct {
     }
 
     pub fn indexFile(self: *SparseNgramIndex, path: []const u8, content: []const u8) !void {
+        return self.indexFileInner(path, content, null);
+    }
+
+    pub const Timing = struct {
+        collect_ns: i128 = 0,
+        publish_ns: i128 = 0,
+    };
+
+    pub fn indexFileTimed(self: *SparseNgramIndex, path: []const u8, content: []const u8, timing: *Timing) !void {
+        timing.* = .{};
+        return self.indexFileInner(path, content, timing);
+    }
+
+    fn indexFileInner(self: *SparseNgramIndex, path: []const u8, content: []const u8, timing: ?*Timing) !void {
         self.removeFile(path);
 
-        const ngrams = try extractSparseNgrams(content, self.allocator);
-        defer self.allocator.free(ngrams);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const temp_alloc = arena.allocator();
 
-        // Deduplicate hashes so the cleanup list stays compact.
-        var seen = std.AutoHashMap(u64, void).init(self.allocator);
+        var seen = std.AutoHashMap(u64, void).init(temp_alloc);
         defer seen.deinit();
 
-        for (ngrams) |ng| {
-            const gop = try self.index.getOrPut(ng.hash);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = std.StringHashMap(void).init(self.allocator);
-            }
-            _ = try gop.value_ptr.getOrPut(path);
-            _ = try seen.getOrPut(ng.hash);
+        const collect_start = std.time.nanoTimestamp();
+        try collectUniqueSparseNgramHashes(content, &seen);
+        if (timing) |t| {
+            t.collect_ns += std.time.nanoTimestamp() - collect_start;
         }
 
         var hash_list: std.ArrayList(u64) = .{};
         errdefer hash_list.deinit(self.allocator);
+        try hash_list.ensureTotalCapacity(self.allocator, seen.count());
+
+        const publish_start = std.time.nanoTimestamp();
+
         var seen_iter = seen.keyIterator();
         while (seen_iter.next()) |h| {
-            try hash_list.append(self.allocator, h.*);
+            const gop = try self.index.getOrPut(h.*);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = std.StringHashMap(void).init(self.allocator);
+            }
+            _ = try gop.value_ptr.getOrPut(path);
+            hash_list.appendAssumeCapacity(h.*);
         }
         try self.file_ngrams.put(path, hash_list);
+        if (timing) |t| {
+            t.publish_ns += std.time.nanoTimestamp() - publish_start;
+        }
     }
 
     /// Find candidate files that may contain the query string.
