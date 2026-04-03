@@ -195,6 +195,18 @@ pub const PostingMask = struct {
     loc_mask: u8 = 0, // bit mask of (position % 8) where trigram appears
 };
 
+const PrehashedStringContext = struct {
+    hash_value: u64,
+
+    pub fn hash(self: @This(), _: []const u8) u64 {
+        return self.hash_value;
+    }
+
+    pub fn eql(_: @This(), a: []const u8, b: []const u8) bool {
+        return std.mem.eql(u8, a, b);
+    }
+};
+
 pub const TrigramIndexTiming = struct {
     collect_ns: i128 = 0,
     publish_ns: i128 = 0,
@@ -234,7 +246,8 @@ pub const TrigramIndex = struct {
     }
 
     pub fn removeFile(self: *TrigramIndex, path: []const u8) void {
-        const trigrams = self.file_trigrams.getPtr(path) orelse return;
+        const entry = self.file_trigrams.getEntry(path) orelse return;
+        const trigrams = entry.value_ptr;
         for (trigrams.items) |tri| {
             if (self.index.getPtr(tri)) |file_set| {
                 _ = file_set.remove(path);
@@ -295,6 +308,7 @@ pub const TrigramIndex = struct {
         try tri_list.ensureTotalCapacity(self.allocator, local.count());
 
         const publish_start = std.time.nanoTimestamp();
+        const path_ctx = PrehashedStringContext{ .hash_value = std.hash_map.hashString(path) };
 
         var local_iter = local.iterator();
         while (local_iter.next()) |entry| {
@@ -305,7 +319,11 @@ pub const TrigramIndex = struct {
             if (!idx_gop.found_existing) {
                 idx_gop.value_ptr.* = std.StringHashMap(PostingMask).init(self.allocator);
             }
-            try idx_gop.value_ptr.put(path, mask);
+            const file_gop = try idx_gop.value_ptr.*.getOrPutAdapted(path, path_ctx);
+            if (!file_gop.found_existing) {
+                file_gop.key_ptr.* = path;
+            }
+            file_gop.value_ptr.* = mask;
             tri_list.appendAssumeCapacity(tri);
         }
         try self.file_trigrams.put(path, tri_list);
@@ -1176,10 +1194,37 @@ pub const default_pair_freq: [256][256]u16 = blk: {
     break :blk table;
 };
 
+const pair_jitter: [256][256]u8 = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var table: [256][256]u8 = undefined;
+    for (0..256) |a| {
+        for (0..256) |b| {
+            const pair = [2]u8{ @intCast(a), @intCast(b) };
+            table[a][b] = @truncate(std.hash.Wyhash.hash(0, &pair) & 0xFF);
+        }
+    }
+    break :blk table;
+};
+
+fn buildPairWeightTable(freq_table: *const [256][256]u16) [256][256]u16 {
+    @setEvalBranchQuota(10_000_000);
+    var table: [256][256]u16 = undefined;
+    for (0..256) |a| {
+        for (0..256) |b| {
+            table[a][b] = freq_table[a][b] +| @as(u16, pair_jitter[a][b]);
+        }
+    }
+    return table;
+}
+
+const default_pair_weight: [256][256]u16 = buildPairWeightTable(&default_pair_freq);
+
 /// Active frequency table — points to the comptime default or a runtime
 /// per-project table.  Swap only before indexing starts (not thread-safe).
 pub var active_pair_freq: *const [256][256]u16 = &default_pair_freq;
 var loaded_freq_table: [256][256]u16 = undefined;
+var loaded_weight_table: [256][256]u16 = undefined;
+var active_pair_weight: *const [256][256]u16 = &default_pair_weight;
 
 
 /// Deterministic weight for a character pair, used to place content-defined
@@ -1188,21 +1233,21 @@ var loaded_freq_table: [256][256]u16 = undefined;
 /// (they become boundaries).  A small hash jitter (0-255) breaks ties
 /// deterministically between pairs in the same frequency tier.
 pub fn pairWeight(a: u8, b: u8) u16 {
-    const freq_weight = active_pair_freq[a][b];
-    const pair = [2]u8{ a, b };
-    const jitter: u16 = @truncate(std.hash.Wyhash.hash(0, &pair) & 0xFF);
-    return freq_weight +| jitter;
+    return active_pair_weight[a][b];
 }
 
 /// Swap in a custom frequency table.  Call before indexing; not thread-safe.
 pub fn setFrequencyTable(table: *const [256][256]u16) void {
     loaded_freq_table = table.*;
+    loaded_weight_table = buildPairWeightTable(table);
     active_pair_freq = &loaded_freq_table;
+    active_pair_weight = &loaded_weight_table;
 }
 
 /// Revert to the built-in comptime frequency table.
 pub fn resetFrequencyTable() void {
     active_pair_freq = &default_pair_freq;
+    active_pair_weight = &default_pair_weight;
 }
 
 /// Build a per-project frequency table by counting byte-pair occurrences in
@@ -1518,7 +1563,8 @@ pub const SparseNgramIndex = struct {
     }
 
     pub fn removeFile(self: *SparseNgramIndex, path: []const u8) void {
-        const ngrams = self.file_ngrams.getPtr(path) orelse return;
+        const entry = self.file_ngrams.getEntry(path) orelse return;
+        const ngrams = entry.value_ptr;
         for (ngrams.items) |hash| {
             if (self.index.getPtr(hash)) |file_set| {
                 _ = file_set.remove(path);
@@ -1567,6 +1613,7 @@ pub const SparseNgramIndex = struct {
         try hash_list.ensureTotalCapacity(self.allocator, seen.count());
 
         const publish_start = std.time.nanoTimestamp();
+        const path_ctx = PrehashedStringContext{ .hash_value = std.hash_map.hashString(path) };
 
         var seen_iter = seen.keyIterator();
         while (seen_iter.next()) |h| {
@@ -1574,7 +1621,10 @@ pub const SparseNgramIndex = struct {
             if (!gop.found_existing) {
                 gop.value_ptr.* = std.StringHashMap(void).init(self.allocator);
             }
-            _ = try gop.value_ptr.getOrPut(path);
+            const file_gop = try gop.value_ptr.*.getOrPutAdapted(path, path_ctx);
+            if (!file_gop.found_existing) {
+                file_gop.key_ptr.* = path;
+            }
             hash_list.appendAssumeCapacity(h.*);
         }
         try self.file_ngrams.put(path, hash_list);
